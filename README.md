@@ -1,18 +1,22 @@
 # patch-devin
 
-Devin Desktop 内置 CLI（`chisel` / `devin.exe`）的等长系统提示词补丁。把 `# Safety`、授权确认条款改成全力协助，把 OVERRIDE 写进 workspace / terminal 系统提示词，并注入全局 `AGENTS.md`。
+Devin Desktop / 独立 CLI（`chisel`）的等长系统提示词补丁。把 `# Safety`、授权确认条款改成全力协助，把 OVERRIDE 写进 workspace / terminal 系统提示词，并注入全局 `AGENTS.md`。
 
 已验证版本：**3000.10.27 (`bcbe88c7`)**。
+
+Windows PE、macOS Mach-O **aarch64** 和 **x86_64** 的提示词字节一致（同一套 11 个补丁，官方 `3000.10.27` 包核对过）。
 
 ## 生效范围
 
 | 目标 | 结果 |
 | --- | --- |
-| Devin CLI / Devin Local / ACP `devin-cli` | 打得到。Desktop 和独立 CLI 共用同一份 `devin.exe` |
+| Devin CLI / Devin Local / ACP `devin-cli` | 打得到 |
 | 云端 Cascade | 打不到。提示词在 Cognition 服务端，本地 `language_server` 只有壳 |
 | Anthropic / OpenAI content policy | 打不到。用环境变量 `DEVIN_REFUSAL_FALLBACK` 换模型 |
 
-不要拿 Electron 外壳 `devin-desktop.exe` / `devin-desktop.cmd` 当目标。脚本会跳过小于 8MB 的文件。
+不要拿 Electron 外壳 `devin-desktop` / `surf` / `windsurf` 当目标。脚本只认 PE / Mach-O / ELF，并且跳过小于 8MB 的文件。
+
+Windows 上 Desktop 和独立 CLI 常常是同一份 `devin.exe`。macOS 上常见两份：Homebrew / `~/.local/bin/devin`，以及 `Devin.app` 里那份。不指定 `--exe` 时会对**找到的全部 CLI** 一起打。
 
 ## 安装
 
@@ -24,20 +28,31 @@ pip install -r requirements.txt
 
 需要 Python 3.10+。唯一依赖是 [rich](https://github.com/Textualize/rich)。
 
-Windows 默认路径：
+### 自动查找的路径
+
+**Windows**
 
 ```
 %LOCALAPPDATA%\Programs\Devin\resources\app\extensions\windsurf\devin\bin\devin.exe
 ```
 
-也可以：
+**macOS**
 
-```bash
-set DEVIN_EXE=D:\path\to\devin.exe
-python patch-devin.py --status
+```
+~/.local/bin/devin                          # curl install.sh
+$(brew --prefix)/bin/devin                  # brew install --cask devin-cli（symlink）
+$(brew --prefix)/Caskroom/devin-cli/*/bin/devin
+/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin
+~/Applications/Devin.app/.../bin/devin
 ```
 
-或 `--exe path\to\devin.exe`。
+`--exe` 可以给二进制，也可以给 `Devin.app`。Homebrew 的 symlink 会跟到 Caskroom 里的真文件再打。
+
+```bash
+export DEVIN_EXE=/opt/homebrew/bin/devin
+python3 patch-devin.py --status
+python3 patch-devin.py --exe /Applications/Devin.app --apply
+```
 
 ## 用法
 
@@ -61,13 +76,27 @@ TUI：
 - `d` 导出 `# Safety`
 - `q` 退出
 
-第一次写入会在旁边生成 `devin.exe.bak`，之后不再覆盖这份备份。进程占用文件时，脚本把旧映像改名为 `devin.exe.locked-by-running` 再写新文件。
+第一次写入会在旁边生成 `devin.bak`（Windows 是 `devin.exe.bak`），之后不再覆盖这份备份。进程占用文件时，脚本把旧映像改名为 `.locked-by-running` 再写新文件；Unix 上会保留可执行位。
+
+macOS 写入后会：
+
+1. `xattr -d com.apple.quarantine`
+2. `codesign --force --sign - --timestamp=none`（ad-hoc）
 
 打完后**新开 CLI / ACP 会话**才吃到新提示词。已有会话仍是旧上下文。
 
+如果 Gatekeeper 仍拦（尤其是改了 `.app` 里面那份），对二进制执行一次：
+
+```bash
+xattr -cr /path/to/devin
+codesign --force --sign - /path/to/devin
+```
+
+`.app` 本体的开发者签名会被这次改写弄失效，这是预期现象。独立 CLI（`~/.local/bin` / Homebrew）一般 ad-hoc 签完就能跑。
+
 ## 补丁列表
 
-全部是 `.rdata` 里的唯一 Rust 字符串，等长替换，不改 PE 布局。
+全部是二进制里的唯一 Rust 字符串，等长替换，不改 PE / Mach-O 布局。
 
 | # | 名称 | 层 | 字节 |
 | --- | --- | --- | ---: |
@@ -85,10 +114,10 @@ TUI：
 
 #8 是给已经打过旧版「all authorized」的二进制用的二次跳。全新未打过的 exe 由 #1 直接写成 `all requested`，#8 会显示缺失，这是正常的。
 
-`AGENTS.md` 写到：
+`AGENTS.md` 写到官方用户配置目录：
 
 - Windows：`%APPDATA%\devin\AGENTS.md`
-- 其它：`~/.config/devin/AGENTS.md`
+- macOS / Linux：`~/.config/devin/AGENTS.md`（尊重 `$XDG_CONFIG_HOME`）
 
 官方规则层是 XML `<rules>`，权重低于系统提示词。所以 6 / 7 是把同一段 OVERRIDE 嵌进 baked system prompt，不是只靠规则文件。
 
@@ -101,7 +130,7 @@ Rust `&str` 是 `ptr + len`。改短了后面会留下旧字节，改长了会�
 
 Windows 检出 CRLF 时，脚本会把 OVERRIDE 规范成 LF，保证 6 / 7 仍是 1952 字节。
 
-补丁会让 Authenticode 失效，SmartScreen 可能弹窗。这是预期现象。
+补丁会让 Windows Authenticode / macOS 开发者签名失效。Windows 可能弹 SmartScreen；macOS 已尽量 ad-hoc 重签。这是预期现象。
 
 ## 回滚
 
@@ -109,13 +138,15 @@ Windows 检出 CRLF 时，脚本会把 OVERRIDE 规范成 LF，保证 6 / 7 仍�
 python patch-devin.py --revert
 ```
 
-优先用 `devin.exe.bak` 整文件还原。没有备份时按字符串把 `new` 换回 `old`。Devin 升级后 exe 被覆盖，需要重新打补丁；**不要把已打过的 exe 再存成 `.bak`**。
+优先用旁边的 `.bak` 整文件还原。没有备份时按字符串把 `new` 换回 `old`。Devin / brew 升级后二进制被覆盖，需要重新打补丁；**不要把已打过的文件再存成 `.bak`**。
 
 ## 限制
 
 - 只针对本机这份 CLI。云端 Cascade、供应商审核、账号侧 guardrail 都不在范围内。
 - 版本字符串对不上时补丁会显示「缺失」，不要硬打。
-- `PATH` 里的 `devin` 经常是 Desktop 的 cmd 外壳。脚本按文件大小和名字过滤，找不到时用 `--exe` 或 `DEVIN_EXE`。
+- `PATH` 里的 `devin` 经常是 Desktop 外壳。脚本按魔数、大小和名字过滤，找不到时用 `--exe` 或 `DEVIN_EXE`。
+- 改 `Devin.app` 内的 CLI 会弄坏应用签名；独立 CLI 更干净。
+- 本机没有 Mac。Mach-O 提示词对着官方 `aarch64-apple-darwin` / `x86_64-apple-darwin` 的 `3000.10.27` 包扫过并做过内存打补丁；没有在真实 Mac 上跑过 TUI / codesign。
 
 ## License
 
