@@ -2,7 +2,7 @@
 
 Devin Desktop / 独立 CLI（`chisel`）的等长系统提示词补丁。把 `# Safety`、授权确认条款改成全力协助，把 OVERRIDE 写进 workspace / terminal 系统提示词，并注入全局 `AGENTS.md`。
 
-已验证版本：**3000.10.27 (`bcbe88c7`)**。当前脚本 **v1.3**。
+已验证版本：**3000.10.27 (`bcbe88c7`)**。当前脚本 **v1.4**。
 
 Windows PE、macOS Mach-O **aarch64** 和 **x86_64** 的提示词字节一致（同一套主补丁，官方 `3000.10.27` 包核对过）。
 
@@ -32,9 +32,20 @@ pip install -r requirements.txt
 
 **Windows**
 
+默认安装：
+
 ```
 %LOCALAPPDATA%\Programs\Devin\resources\app\extensions\windsurf\devin\bin\devin.exe
 ```
+
+装到别的盘时，还会从这些地方反查安装根目录，再定位里面的 CLI（不会把桌面壳 `Devin.exe` 当成 CLI）：
+
+- 桌面 / 公共桌面 / 开始菜单 / 任务栏钉住的 `*Devin*.lnk`（含 OneDrive 桌面）
+- PATH 上的 `devin` / `devin.exe` / `devin.cmd`，以及 `devin-desktop` 外壳脚本
+- `where.exe devin`
+- 卸载项 `InstallLocation`、`DisplayIcon`，以及 App Paths 里的 `devin*`
+
+`--exe` 可以给 CLI 二进制、安装目录、`Devin.exe` 外壳，或桌面快捷方式 `.lnk`。
 
 **macOS**
 
@@ -46,9 +57,14 @@ $(brew --prefix)/Caskroom/devin-cli/*/bin/devin
 ~/Applications/Devin.app/.../bin/devin
 ```
 
-`--exe` 可以给二进制，也可以给 `Devin.app`。Homebrew 的 symlink 会跟到 Caskroom 里的真文件再打。
+macOS 上 `--exe` 可以给二进制，也可以给 `Devin.app`。Homebrew 的 symlink 会跟到 Caskroom 里的真文件再打。
 
 ```bash
+# Windows：从桌面图标或安装目录进去
+python patch-devin.py --exe %USERPROFILE%\Desktop\Devin.lnk --status
+python patch-devin.py --exe D:\Apps\Devin --apply
+
+# macOS
 export DEVIN_EXE=/opt/homebrew/bin/devin
 python3 patch-devin.py --status
 python3 patch-devin.py --exe /Applications/Devin.app --apply

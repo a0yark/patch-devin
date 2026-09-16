@@ -27,7 +27,7 @@ Devin CLI 系统提示词等长补丁 (chisel / devin)
   python patch-devin.py --revert        回滚（优先 .bak）
   python patch-devin.py --status        显示状态
   python patch-devin.py --dump [DIR]    导出当前 # Safety 段
-  python patch-devin.py --exe PATH      只处理这一份二进制（或 Devin.app）
+  python patch-devin.py --exe PATH      只处理这一份二进制（Devin.app / .lnk 也可）
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ from rich import box
 
 console = Console()
 
-VERSION = "1.3"
+VERSION = "1.4"
 TESTED_VERSIONS = {"3000.10.27"}
 MIN_CLI_BYTES = 8 * 1024 * 1024
 SHIM_NAMES = {
@@ -148,11 +148,29 @@ def binary_kind(path: str) -> str | None:
     return None
 
 
+def _looks_like_install_root(path: str) -> bool:
+    if not path or not os.path.isdir(path):
+        return False
+    return (
+        os.path.isdir(os.path.join(path, "resources", "app"))
+        or os.path.isdir(os.path.join(path, "Contents", "Resources", "app"))
+    )
+
+
+def _is_electron_shell(path: str) -> bool:
+    """Desktop `Devin.exe` sits next to `resources/app`; the CLI does not."""
+    if not path or not os.path.isfile(path):
+        return False
+    return _looks_like_install_root(os.path.dirname(os.path.abspath(path)))
+
+
 def _looks_like_cli(path: str, *, require_size: bool = True) -> bool:
     base = os.path.basename(path).lower()
     if base in SHIM_NAMES:
         return False
     if not os.path.isfile(path):
+        return False
+    if _is_electron_shell(path):
         return False
     try:
         if require_size and os.path.getsize(path) < MIN_CLI_BYTES:
@@ -165,19 +183,396 @@ def _looks_like_cli(path: str, *, require_size: bool = True) -> bool:
     return True
 
 
-def canonicalize_cli(path: str, *, require_size: bool = True) -> str | None:
+def _decode_ansiz(buf: bytes) -> str:
+    raw = buf.split(b"\x00", 1)[0]
+    enc = "mbcs" if os.name == "nt" else "latin-1"
+    return raw.decode(enc, "replace")
+
+
+def _decode_utf16z(buf: bytes) -> str:
+    end = 0
+    while end + 1 < len(buf) and buf[end:end + 2] != b"\x00\x00":
+        end += 2
+    return buf[:end].decode("utf-16-le", "replace")
+
+
+def _read_lnk_target(path: str) -> str | None:
+    """Resolve a .lnk to TargetPath, or WorkingDirectory if the target is gone."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(65536)
+    except OSError:
+        return None
+    if len(data) < 0x4C or data[:4] != b"\x4c\x00\x00\x00":
+        return None
+    flags = int.from_bytes(data[0x14:0x18], "little")
+    off = 0x4C
+    target = None
+    workdir = None
+    try:
+        if flags & 0x01:
+            idlen = int.from_bytes(data[off:off + 2], "little")
+            off += 2 + idlen
+        if flags & 0x02:
+            lisz = int.from_bytes(data[off:off + 4], "little")
+            li = data[off:off + lisz]
+            off += lisz
+            if len(li) >= 0x18:
+                hdr = int.from_bytes(li[4:8], "little")
+                lif = int.from_bytes(li[8:12], "little")
+                if lif & 1:
+                    if hdr >= 0x24 and len(li) >= 0x20:
+                        uoff = int.from_bytes(li[28:32], "little")
+                        if 0 < uoff < len(li):
+                            target = _decode_utf16z(li[uoff:]) or None
+                    if not target:
+                        aoff = int.from_bytes(li[16:20], "little")
+                        if 0 < aoff < len(li):
+                            target = _decode_ansiz(li[aoff:]) or None
+        is_uni = bool(flags & 0x80)
+
+        def _read_str() -> str | None:
+            nonlocal off
+            if off + 2 > len(data):
+                return None
+            n = int.from_bytes(data[off:off + 2], "little")
+            off += 2
+            if is_uni:
+                nbytes = n * 2
+                s = data[off:off + nbytes].decode("utf-16-le", "replace")
+            else:
+                nbytes = n
+                s = _decode_ansiz(data[off:off + nbytes] + b"\x00")
+            off += nbytes
+            return s or None
+
+        if flags & 0x04:
+            _read_str()
+        if flags & 0x08:
+            _read_str()
+        if flags & 0x10:
+            workdir = _read_str()
+    except (IndexError, ValueError, OSError):
+        pass
+
+    if target:
+        target = os.path.expandvars(target.strip().strip('"'))
+        if os.path.exists(target):
+            return target
+    if workdir:
+        workdir = os.path.expandvars(workdir.strip().strip('"'))
+        if os.path.isdir(workdir):
+            for name in ("Devin.exe", "devin.exe", "Devin"):
+                cand = os.path.join(workdir, name)
+                if os.path.isfile(cand):
+                    return cand
+            return workdir
+    return target if target else None
+
+
+def _windows_known_folder(csidl: int) -> str | None:
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0:
+            p = buf.value
+            return p if p and os.path.isdir(p) else None
+    except Exception:
+        return None
+    return None
+
+
+def _windows_shortcut_dirs() -> list[str]:
+    home = os.path.expanduser("~")
+    appdata = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    public = os.environ.get("PUBLIC") or r"C:\Users\Public"
+    dirs = [
+        _windows_known_folder(0x10),  # Desktop
+        _windows_known_folder(0x19),  # Public Desktop
+        _windows_known_folder(0x02),  # Start Menu\Programs
+        _windows_known_folder(0x17),  # Common Start Menu\Programs
+        os.path.join(home, "Desktop"),
+        os.path.join(public, "Desktop"),
+        os.path.join(home, "OneDrive", "Desktop"),
+        os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs"),
+        os.path.join(
+            appdata, "Microsoft", "Internet Explorer",
+            "Quick Launch", "User Pinned", "TaskBar",
+        ),
+    ]
+    out, seen = [], set()
+    for d in dirs:
+        if not d:
+            continue
+        d = os.path.abspath(d)
+        key = os.path.normcase(d)
+        if key in seen or not os.path.isdir(d):
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
+def _iter_devin_shortcuts() -> list[str]:
+    found: list[str] = []
+    for root in _windows_shortcut_dirs():
+        for dirpath, _dirs, files in os.walk(root):
+            rel = os.path.relpath(dirpath, root)
+            if rel != "." and rel.count(os.sep) > 3:
+                _dirs[:] = []
+                continue
+            for name in files:
+                if not name.lower().endswith(".lnk"):
+                    continue
+                stem = name[:-4].lower()
+                if re.match(r"(devin|windsurf)(\s|$|[-_.])", stem) or stem in {
+                    "devin", "windsurf",
+                }:
+                    found.append(os.path.join(dirpath, name))
+    return found
+
+
+def _where_cmd(name: str) -> list[str]:
+    try:
+        kwargs: dict = dict(
+            text=True, stderr=subprocess.DEVNULL, timeout=8,
+        )
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        out = subprocess.check_output(["where.exe", name], **kwargs)
+    except Exception:
+        return []
+    return [ln.strip().strip('"') for ln in out.splitlines() if ln.strip()]
+
+
+def _command_hints() -> list[str]:
+    """Whatever `devin` / `devin-desktop` resolves to on PATH."""
+    names = ["devin", "devin.exe", "devin.cmd", "devin.bat"]
+    if os.name == "nt":
+        names += [
+            "devin-desktop", "devin-desktop.cmd", "devin-desktop.exe",
+        ]
+    else:
+        names.append("devin-desktop")
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(p: str) -> None:
+        p = p.strip().strip('"')
+        if not p:
+            return
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(p)
+
+    for name in names:
+        w = shutil.which(name)
+        if w:
+            _add(w)
+    if os.name == "nt":
+        for w in _where_cmd("devin"):
+            _add(w)
+        # PATH 目录里叫 devin* 的文件（含无扩展名的 shim）
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            d = d.strip().strip('"')
+            if not d or not os.path.isdir(d):
+                continue
+            try:
+                names_in_dir = os.listdir(d)
+            except OSError:
+                continue
+            for n in names_in_dir:
+                nl = n.lower()
+                if (
+                    nl in SHIM_NAMES
+                    or nl in {"devin", "devin.exe", "devin.cmd", "devin.bat", "devin.sh"}
+                    or nl.startswith("devin-desktop")
+                ):
+                    _add(os.path.join(d, n))
+    return out
+
+
+def _windows_registry_hints() -> list[str]:
+    try:
+        import winreg
+    except ImportError:
+        return []
+    out: list[str] = []
+
+    def _add_val(val: object) -> None:
+        if not isinstance(val, str) or not val.strip():
+            return
+        s = val.strip().strip('"')
+        if "," in os.path.basename(s):
+            # DisplayIcon 常见 `C:\...\Devin.exe,0`
+            s = s.rsplit(",", 1)[0]
+        out.append(s)
+
+    app_path_keys = (
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\App Paths"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\App Paths"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"),
+    )
+    uninstall_keys = (
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    )
+
+    for hive, sub in app_path_keys:
+        try:
+            h = winreg.OpenKey(hive, sub)
+        except OSError:
+            continue
+        i = 0
+        while True:
+            try:
+                name = winreg.EnumKey(h, i)
+            except OSError:
+                break
+            i += 1
+            if not re.search(r"devin|windsurf", name, re.I):
+                continue
+            try:
+                k = winreg.OpenKey(h, name)
+            except OSError:
+                continue
+            try:
+                _add_val(winreg.QueryValueEx(k, None)[0])
+            except OSError:
+                pass
+            try:
+                _add_val(winreg.QueryValueEx(k, "Path")[0])
+            except OSError:
+                pass
+            winreg.CloseKey(k)
+        winreg.CloseKey(h)
+
+    for hive, sub in uninstall_keys:
+        try:
+            h = winreg.OpenKey(hive, sub)
+        except OSError:
+            continue
+        i = 0
+        while True:
+            try:
+                name = winreg.EnumKey(h, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                k = winreg.OpenKey(h, name)
+            except OSError:
+                continue
+            try:
+                display = winreg.QueryValueEx(k, "DisplayName")[0]
+            except OSError:
+                winreg.CloseKey(k)
+                continue
+            if not isinstance(display, str) or not re.search(r"devin|windsurf", display, re.I):
+                winreg.CloseKey(k)
+                continue
+            for val_name in ("InstallLocation", "DisplayIcon", "UninstallString"):
+                try:
+                    _add_val(winreg.QueryValueEx(k, val_name)[0])
+                except OSError:
+                    pass
+            winreg.CloseKey(k)
+        winreg.CloseKey(h)
+    return out
+
+
+def _wrapper_targets(path: str) -> list[str]:
+    """Pull Devin.exe / CLI paths out of .cmd / shim scripts."""
+    base = os.path.basename(path).lower()
+    if not (
+        base.endswith((".cmd", ".bat", ".ps1", ".sh"))
+        or base in SHIM_NAMES
+        or base.startswith("devin-desktop")
+    ):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(12000)
+    except OSError:
+        return []
+    dp0 = os.path.dirname(os.path.abspath(path)) + os.sep
+    expanded = text.replace("%~dp0", dp0).replace("%~DP0", dp0)
+    out: list[str] = []
+    for m in re.finditer(r'"([^"\n]+)"', expanded):
+        cand = os.path.normpath(m.group(1))
+        low = cand.lower()
+        if low.endswith(".exe") or low.endswith(".app") or os.path.basename(low) in {
+            "devin", "devin.exe",
+        }:
+            out.append(cand)
+    for m in re.finditer(
+        r'([A-Za-z]:\\[^"\s\']+[Dd]evin[^"\s\']*\.exe)', expanded,
+    ):
+        out.append(m.group(1))
+    return out
+
+
+def _install_root_from_file(path: str) -> str | None:
+    path = os.path.abspath(path)
+    d = os.path.dirname(path)
+    if _looks_like_install_root(d):
+        return d
+    base = os.path.basename(path).lower()
+    parent = os.path.dirname(d)
+    if (
+        base in SHIM_NAMES
+        or base.startswith("devin-desktop")
+        or os.path.basename(d).lower() == "bin"
+    ):
+        if _looks_like_install_root(parent):
+            return parent
+    return None
+
+
+def canonicalize_cli(path: str, *, require_size: bool = True, _depth: int = 0) -> str | None:
+    if _depth > 6 or not path:
+        return None
     path = os.path.abspath(os.path.expanduser(path))
+    if path.lower().endswith(".lnk"):
+        target = _read_lnk_target(path)
+        return canonicalize_cli(target, require_size=require_size, _depth=_depth + 1) if target else None
+    if not os.path.exists(path):
+        return None
     if os.path.isdir(path):
         found: list[str] = []
         _collect_install_root(path, found)
-        return found[0] if found else None
+        if not found and os.path.basename(path).lower() == "bin":
+            _collect_install_root(os.path.dirname(path), found)
+        if not found:
+            parent = os.path.dirname(path)
+            if _looks_like_install_root(parent):
+                _collect_install_root(parent, found)
+        for cand in found:
+            if _looks_like_cli(cand, require_size=require_size):
+                return os.path.realpath(cand)
+        return None
     if os.path.islink(path):
         real = os.path.realpath(path)
-        if _looks_like_cli(real, require_size=require_size):
-            return real
-        return None
+        if real != path:
+            got = canonicalize_cli(real, require_size=require_size, _depth=_depth + 1)
+            if got:
+                return got
+    root = _install_root_from_file(path)
+    if root:
+        found: list[str] = []
+        _collect_install_root(root, found)
+        for cand in found:
+            if _looks_like_cli(cand, require_size=require_size):
+                return os.path.realpath(cand)
     if _looks_like_cli(path, require_size=require_size):
         return os.path.realpath(path) if os.path.exists(path) else path
+    for inner in _wrapper_targets(path):
+        got = canonicalize_cli(inner, require_size=require_size, _depth=_depth + 1)
+        if got:
+            return got
     return None
 
 
@@ -195,7 +590,7 @@ def find_devin_exe() -> str | None:
 
 
 def find_all_devin_exes() -> list[str]:
-    """All real CLI binaries, desktop shim excluded. PATH / brew / app bundle."""
+    """All real CLI binaries, desktop shim excluded. PATH / shortcut / brew / app bundle."""
     raw: list[str] = []
     home = os.path.expanduser("~")
     local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
@@ -205,9 +600,11 @@ def find_all_devin_exes() -> list[str]:
         if v:
             raw.append(v)
 
-    which = shutil.which("devin")
-    if which:
-        raw.append(which)
+    raw.extend(_command_hints())
+
+    if os.name == "nt":
+        raw.extend(_iter_devin_shortcuts())
+        raw.extend(_windows_registry_hints())
 
     raw.extend([
         os.path.join(home, ".local", "bin", "devin"),
@@ -1302,8 +1699,8 @@ def main():
     )
     parser.add_argument(
         "--exe",
-        help="只处理这一份 CLI（文件或 Devin.app）。默认处理找到的全部副本。"
-             "也可用环境变量 DEVIN_EXE",
+        help="只处理这一份 CLI（文件、安装目录、Devin.app 或 .lnk）。"
+             "默认处理找到的全部副本。也可用环境变量 DEVIN_EXE",
     )
     g = parser.add_mutually_exclusive_group()
     g.add_argument("--apply", "-a", action="store_true", help="静默应用默认补丁")
