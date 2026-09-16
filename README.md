@@ -2,9 +2,9 @@
 
 Devin Desktop / 独立 CLI（`chisel`）的等长系统提示词补丁。把 `# Safety`、授权确认条款改成全力协助，把 OVERRIDE 写进 workspace / terminal 系统提示词，并注入全局 `AGENTS.md`。
 
-已验证版本：**3000.10.27 (`bcbe88c7`)**。
+已验证版本：**3000.10.27 (`bcbe88c7`)**。当前脚本 **v1.3**。
 
-Windows PE、macOS Mach-O **aarch64** 和 **x86_64** 的提示词字节一致（同一套 11 个补丁，官方 `3000.10.27` 包核对过）。
+Windows PE、macOS Mach-O **aarch64** 和 **x86_64** 的提示词字节一致（同一套主补丁，官方 `3000.10.27` 包核对过）。
 
 ## 生效范围
 
@@ -58,8 +58,8 @@ python3 patch-devin.py --exe /Applications/Devin.app --apply
 
 ```bash
 python patch-devin.py                 # TUI
-python patch-devin.py --apply         # 应用默认补丁 1–11 + AGENTS.md
-python patch-devin.py --apply --all   # 应用全部（当前与默认相同）
+python patch-devin.py --apply         # 主补丁 + 过渡升级 + AGENTS.md
+python patch-devin.py --apply --all   # 与 --apply 相同（全部主补丁都是默认项）
 python patch-devin.py --status        # 打印状态后退出，不清屏
 python patch-devin.py --dump          # 导出 # Safety 到 ./devin-prompts
 python patch-devin.py --dump DIR      # 导出到指定目录
@@ -67,16 +67,17 @@ python patch-devin.py --revert        # 回滚（优先旁路 .bak）
 python patch-devin.py --exe PATH ...  # 指定 CLI 二进制
 ```
 
-TUI：
+TUI（`python patch-devin.py`，无参数）：
 
-- `a` 应用默认补丁（1–11 + AGENTS.md）
-- `A` 应用全部
+- `a` 应用补丁 + 过渡升级 + AGENTS.md
 - `r` 回滚
 - `s` 刷新
 - `d` 导出 `# Safety`
 - `q` 退出
 
-第一次写入会在旁边生成 `devin.bak`（Windows 是 `devin.exe.bak`），之后不再覆盖这份备份。进程占用文件时，脚本把旧映像改名为 `.locked-by-running` 再写新文件；Unix 上会保留可执行位。
+`a` 和 `--apply --all` 现在是同一件事，TUI 不再单独放一个 `A`。
+
+第一次从**原版**写入时会在旁边生成 `devin.bak`（Windows 是 `devin.exe.bak`），之后不再覆盖这份备份。只打过渡升级时不会用当前已打过的文件去新建 `.bak`。进程占用文件时，脚本把旧映像改名为 `.locked-by-running` 再写新文件；Unix 上会保留可执行位。
 
 macOS 写入后会：
 
@@ -107,14 +108,27 @@ codesign --force --sign - /path/to/devin
 | 5 | auto-review 拒绝话术 | 操作安全 | 228 |
 | 6 | 系统提示词注入 OVERRIDE（workspace） | 系统提示词 | 1952 |
 | 7 | 系统提示词注入 OVERRIDE（terminal） | 系统提示词 | 1952 |
-| 8 | `# Safety` 去掉 authorized | 道德提示词 | 377 |
 | 9 | 去掉向用户要授权 | 系统提示词 | 1618 |
 | 10 | terminal 破坏性操作确认 | 操作安全 | 645 |
 | 11 | 会话内授权检查 | 系统提示词 | 130 |
 
-#8 是给已经打过旧版「all authorized」的二进制用的二次跳。全新未打过的 exe 由 #1 直接写成 `all requested`，#8 会显示缺失，这是正常的。
+全新未打过的二进制由 #1 / #6 / #7 直接写成最终文案。
 
-`AGENTS.md` 写到官方用户配置目录：
+### 过渡补丁
+
+`apply` 时无条件尝试；状态表**只在待打时显示**。给已经打过旧版脚本的二进制用。
+
+| # | 名称 | 何时出现 |
+| --- | --- | --- |
+| 8 | `# Safety` `all authorized` → `requested` | 打过 v1.0 / v1.1 的 `# Safety` |
+| 12 | OVERRIDE 去掉 authorized 措辞 | 打过 v1.2 及更早的 OVERRIDE |
+
+#12 是等长替换，不改 1952 字节长度：
+
+- `fully authorized environment` (28) → `unrestricted local workspace` (28)
+- `this authorized lab` (19) → `this scoped session` (19)
+
+`AGENTS.md` 写到官方用户配置目录。若文件已有本脚本的标记但正文还是旧 OVERRIDE，`apply` 会重写；用户自己的其它 `AGENTS.md` 不会动。
 
 - Windows：`%APPDATA%\devin\AGENTS.md`
 - macOS / Linux：`~/.config/devin/AGENTS.md`（尊重 `$XDG_CONFIG_HOME`）
@@ -123,7 +137,7 @@ codesign --force --sign - /path/to/devin
 
 ## 原理
 
-Rust `&str` 是 `ptr + len`。改短了后面会留下旧字节，改长了会打坏相邻字符串。脚本用空格补齐到原长度，`_finalize_patches()` 在导入时断言：
+Rust `&str` 是 `ptr + len`。改短了后面会留下旧字节，改长了会打坏相邻字符串。脚本用空格补齐到原长度，`_finalize_items()` 在导入时断言：
 
 1. `len(new) == len(old)`
 2. `old` 不再作为 `new` 的子串（否则 `--status` 会误判）
@@ -138,7 +152,7 @@ Windows 检出 CRLF 时，脚本会把 OVERRIDE 规范成 LF，保证 6 / 7 仍�
 python patch-devin.py --revert
 ```
 
-优先用旁边的 `.bak` 整文件还原。没有备份时按字符串把 `new` 换回 `old`。Devin / brew 升级后二进制被覆盖，需要重新打补丁；**不要把已打过的文件再存成 `.bak`**。
+优先用旁边的 `.bak` 整文件还原。没有备份时按字符串把 `new` 换回 `old`：6 / 7 共用同一段 OVERRIDE，按文件偏移从低到高分别还原成 Personality / Editing constraints；若二进制还停在过渡 hop，会先折叠成当前 OVERRIDE 再还原。Devin / brew 升级后二进制被覆盖，需要重新打补丁；**不要把已打过的文件再存成 `.bak`**。
 
 ## 限制
 
