@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+devin-prompts/
+*.bak
+*.locked-by-running
+*.locked-*
+.DS_Store
+Thumbs.db
