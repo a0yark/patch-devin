@@ -93,7 +93,7 @@ TUI（`python patch-devin.py`，无参数）：
 - `d` 导出 `# Safety`
 - `q` 退出
 
-`a` 和 `--apply --all` 现在是同一件事，TUI 不再单独放一个 `A`。
+`--apply --all` 与 `--apply` 相同：全部主补丁都是默认项。
 
 第一次从**原版**写入时会在旁边生成 `devin.bak`（Windows 是 `devin.exe.bak`），之后不再覆盖这份备份。只打过渡升级时不会用当前已打过的文件去新建 `.bak`。进程占用文件时，脚本把旧映像改名为 `.locked-by-running` 再写新文件；Unix 上会保留可执行位。
 
@@ -179,6 +179,30 @@ python patch-devin.py --revert
 - `PATH` 里的 `devin` 经常是 Desktop 外壳。脚本按魔数、大小和名字过滤，找不到时用 `--exe` 或 `DEVIN_EXE`。
 - 改 `Devin.app` 内的 CLI 会弄坏应用签名；独立 CLI 更干净。
 - 本机没有 Mac。Mach-O 提示词对着官方 `aarch64-apple-darwin` / `x86_64-apple-darwin` 的 `3000.10.27` 包扫过并做过内存打补丁；没有在真实 Mac 上跑过 TUI / codesign。
+
+## 更新日志
+
+### v1.4
+
+- Windows 从桌面 / 开始菜单 `.lnk`、PATH 上的 `devin` / `devin-desktop`、卸载项和 App Paths 反查安装目录
+- 桌面壳 `Devin.exe` 不再被当成 CLI；`--exe` 可给安装目录或快捷方式
+- README 加上 [LINUX DO](https://linux.do) 友链
+
+### v1.3
+
+- `#8` / `#12` 从主表拆成过渡 hop：`apply` 必跑，状态表只在待打时显示
+- OVERRIDE 等长去掉 `fully authorized environment` / `this authorized lab`
+- hop 升级会真正写入；过期 `AGENTS.md` 会重写；已有 `.bak` 不覆盖
+- TUI 只保留 `a`（与 `--apply --all` 相同）
+
+### v1.2
+
+- 适配 macOS：Mach-O 查找、ad-hoc codesign、清 quarantine
+- 不指定 `--exe` 时对找到的全部 CLI 一起打
+
+### v1.1
+
+- 初始发布：Windows PE 等长补丁、TUI、`AGENTS.md` 注入
 
 ## 友链
 
