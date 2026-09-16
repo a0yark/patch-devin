@@ -1,5 +1,7 @@
 # patch-devin
 
+[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-新的理想型社区-FDD047?labelColor=1a1a1a)](https://linux.do)
+
 Devin Desktop / 独立 CLI（`chisel`）的等长系统提示词补丁。把 `# Safety`、授权确认条款改成全力协助，把 OVERRIDE 写进 workspace / terminal 系统提示词，并注入全局 `AGENTS.md`。
 
 已验证版本：**3000.10.27 (`bcbe88c7`)**。当前脚本 **v1.4**。
@@ -177,6 +179,10 @@ python patch-devin.py --revert
 - `PATH` 里的 `devin` 经常是 Desktop 外壳。脚本按魔数、大小和名字过滤，找不到时用 `--exe` 或 `DEVIN_EXE`。
 - 改 `Devin.app` 内的 CLI 会弄坏应用签名；独立 CLI 更干净。
 - 本机没有 Mac。Mach-O 提示词对着官方 `aarch64-apple-darwin` / `x86_64-apple-darwin` 的 `3000.10.27` 包扫过并做过内存打补丁；没有在真实 Mac 上跑过 TUI / codesign。
+
+## 友链
+
+- [LINUX DO](https://linux.do) — 新的理想型社区
 
 ## License
 
